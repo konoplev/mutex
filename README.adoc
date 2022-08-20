@@ -1,0 +1,449 @@
+= Races, Semaphores and Mutexes
+
+== Intro
+
+== Theory
+=== Synchronization
+
+https://github.com/konoplev/thread#threads-synchronization[As we discussed previously], sometimes threads need to synchronize. It's required because the threads are executed by scheduler, and we can't control the order of execution. Sometimes the order is important. There are two cases when we need to synchronize:
+
+1. Multiple threads read and update shared data. Without synchronization, it can become inconsistent.
+2. A thread needs to wait for another thread to finish its work.
+
+==== Races
+
+Each thread has its own memory. Everything created withing the thread's lambda is local to the thread and not visible to any other thread. But any thread launching a new thread can pass its local variables to the new thread. This is how the variables can be shared between threads.
+
+Imaging that there is a main thread that has a counter set to zero. The main thread creates two threads (A and B) and pass the counter to them to be incremented. Thread A starts and reading the counter. It's zero. Then thread B starts and also reading the counter. It's zero. Then thread A increments the counter. It's one. Then thread B increments the counter. It's also one. Thread A writes the value to the counter and thread B writes the value to the counter. The counter is one but have to be two. This is a race condition called "lost update". And this is a good example of why it's important to protect a shared data. Thread B should wait until thread A is done with the update and only after that it should read the counter.
+
+==== Linearizability
+
+or it's called "serializability"? http://www.bailis.org/blog/linearizability-versus-serializability/
+
+What we expect from concurrent code? It should be executed in the same way as it would be executed in a sequential code. Either actor A increments the counter and then actor B increments the counter or actor B increments the counter and then actor A increments the counter. In any case the counter should be incremented by two. It can't be one.
+
+==== Atomicity
+What is the problem with the counter? The problem is that there are 3 operations: read the counter from shared memory to thread's local memory, increment it in local memory and write the new value back to the shared memory. And since there could be a switch from thread A to thread B between read and write, another thread could read the old value.
+
+[source,java,linenums]
+--------
+  private static class Counter {
+
+    private int count = 0;
+
+    public int getCount() {
+      return count;
+    }
+
+    public void increment() {
+      count++;
+      //long version:
+      // int localCount = count;
+      // localCount = localCount + 1;
+      // count = localCount;
+
+    }
+
+  }
+--------
+
+To reproduce the problem we can use https://github.com/Kotlin/kotlinx-lincheck[kotlinx-lincheck] library. The library receives methods marked with `@Operation` to generate multiple scenarios of concurrent executions of the operations. And then it checks each execution for lineralizability. Can the result produced by threads executing the operations in parallel be produced by a single thread executing operations in sequential order? If there is no such order, the test fails. We can't call the increment twice and get 1 as a result executing things sequentially but we have this result executing them in parallel. So the https://xxx[LostUpdateIntCounterTest] fails and prints to output the failed scenario.
+
+=== Mutex
+What's the solution? The solution is to do read, increment and write as a one operation or atomically. In our case, there are threads A and B that are about to perform the atomic operation called "atomic increment" (that consists of 3 steps: read, increment, write). Atomicity means that if thread A already started the operation then thread B should wait until thread A is done with all 3 steps.
+
+The mechanism allowed implementing atomic operations is called **mut**ual **ex**clusion or mutex. What is mutex? Imagine a rostrum and a forum. Anyone from the forum's audience could potentially speak but to make things organized, only one who is on rostrum is allowed to speak and no one can interrupt the speaker. When the speaker is done she can release the rostrum to let someone else to speak. Each person is a thread and the rostrum is a mutex in our example.
+
+To make a set of steps atomic, we need to add mutex acquisition before the set and mutex release after the set. This is how the mutex protects the set of operations from parallel execution (i.e. interruptions).
+
+So, to fix our counter:
+
+[source,java,linenums]
+------------
+  private static class Counter {
+
+    private int count = 0;
+    private Lock lock = new ReentrantLock();
+
+    public int getCount() {
+      return count;
+    }
+
+    public void increment() {
+      //count++;
+      lock.lock();
+      try {
+        int localCount = count;
+        localCount = localCount + 1;
+        count = localCount;
+      } finally {
+        lock.unlock();
+      }
+
+    }
+
+  }
+------------
+The lock is basically a mutex protecting the counter increment from concurrent execution. If there are multiple threads executing the `Counter.increment()` only one of them will be able to proceed `lock.lock()`. All other threads are blocked on it until the thread acquired the lock called `lock.unlock()`. The `ReentrantLock` is a lock that allows a thread to not block itself by calling the `lock()` method multiple times (for example if the thread calls `lock.lock()` and then calls a method that also has `lock.lock()`). It's a good practice to have `lock.unlock()` in the "finally" section to guarantee unlocking.
+
+This is a test demonstrating the lock.
+[source,java,linenums]
+----
+    ReentrantLock lock = new ReentrantLock();
+    AtomicBoolean protectedSectionReached = new AtomicBoolean(false);
+
+    Thread child = new Thread(() -> {
+      lock.lock();
+      protectedSectionReached.set(true);
+    });
+
+    //lock is acquired by the main thread
+    lock.lock();
+    child.start();
+    run100Ms();
+
+    assertThat(protectedSectionReached.get(), is(false));
+    assertThat(child.getState(), is(WAITING));
+
+    lock.unlock();
+    run100Ms();
+    assertThat(protectedSectionReached.get(), is(true));
+    assertThat(child.getState(), is(TERMINATED));
+----
+Since the lock is acquired by the main thread, the child thread is blocked on it. The child thread is waiting for the lock to be released.
+
+It's worth to mention that there are AtomicInteger, AtomicLong and other atomic versions of the primitive types. So, there is no reason to implement our own atomic counter. But please note, the class itself doesn't guarantee atomicity, it just provides atomic operations. There following increment is not atomic:
+
+[source,java,linenums]
+---------
+  private static class Counter {
+
+    private AtomicInteger count = new AtomicInteger(0);
+
+    public int getCount() {
+      return count.get();
+    }
+
+    public void increment() {
+      // wrong implementation
+      count.set(count.get() + 1);
+    }
+  }
+---------
+
+You should use `AtomicInteger.incrementAndGet()` or `AtomicInteger.getAndIncrement()` (we don't use the result immediately, so it doesn't matter which method to call) instead, which are the atomic increment methods.
+
+=== Blocked Thread
+
+There is another way to create a mutex in Java. It's `synchronized` word that can be used on method level or on a block level. A thread that is blocked on this mutex is in `BLOCKED` state. The problem with this approach is that a thread waiting in the `BLOCKED` state is not able to handle interruption. See the example below:
+
+[source,java,linenums]
+----------
+    final Object lock = new Object();
+    Thread thread = new Thread(() -> {
+      synchronized(lock){
+        //do something here
+      }
+    });
+    synchronized (lock){
+      thread.start();
+      thread.join(100);
+      assertThat(thread.getState(), is(State.BLOCKED));
+      thread.interrupt();
+      thread.join(100);
+      assertThat(thread.getState(), is(State.BLOCKED));
+    }
+----------
+
+We discussed in https://github.com/konoplev/thread#how-to-stop-a-thread[the previous blog post] that it's very important to be interuptable. The big advantage of the ReeentrantLock is that there is an interruptable version of the lock() method (called `ReentrantLock.lockInterruptibly()`). See `TestThreadInBlockedState.testInterruptWaitingThread()` for an example.
+
+=== Dirty read
+
+Is it enough to have the update operation atomic to protect the variable shared among threads? In our case there is only one variable and the answer is yes. You can check it by adding the lock to the `increment` method and restarting the test. If there is only one field and update is atomic then the read is also atomic.
+
+But that doesn't work in case we have two fields (numerical and string representation of the counter).
+
+[source,java,linenums]
+-----------------
+  private static class StringAndNumber {
+
+    private int number = 0;
+    private String string = "0";
+    private Lock lock = new ReentrantLock();
+    public int getNumber() {
+      return number;
+    }
+
+    private String getString() {
+      return string;
+    }
+
+    public void increment() {
+      lock.lock();
+      try {
+        number++;
+        string = String.valueOf(number);
+      } finally {
+        lock.unlock();
+      }
+    }
+  }
+-----------------
+
+The atomicity of the update operation is not enough to protect the read. If you run the `DirtyReadTest` you will see that the failed scenario.
+
+-------------
+Parallel part:
+| getNumber(): 1 | increment(): void |
+| getString(): 0 |                   |
+-------------
+While one thread is incrementing, another thread is reading. The reader could get the first field updated but the second field is still having the old value. The operation is atomic from writing threads perspective, but it's not from reading threads point of view. We can easily fix it by adding the lock to read methods as well. And this is actually how we can prevent any inconsistency - just make **all** methods interacting with the shared state available to only one thread at a time. But that's not probably what we want. Our initial intent is to have threads running in parallel, so we can unilize resources more efficiently. But if each method is exclusive and blocks all threads except one acquired the lock then the execution is sequential. We lost any parallelism.
+
+Imaging that we have only one thread incrementing the counter and 1000 threads reading it. All threads have to wait for the lock to be released by the updating thread. That's fine. That makes both fields consistent for the readers. But since both read methods (`getNumber` and `getString`) are blocking now, each reader should wait for another reader. Parallel reads are not allowed anymore, despite the fact the reading threads can't impact each other.
+
+The better solution is to block readers while there is an update in progress, but as soon as the update is done, it's safe to read in parallel. So, we need two locks: one for the update operation and one for the read operation. The locks are depends on each other. The read lock is not exclusive. Multiple threads can acquire it. So, reading threads don't need to waite for each other. But if the write lock is acquired then the read lock is not allowed to be acquired, it should wait until write lock is released. This is how we make all readers to wait until the increment is done. Also wait lock can't be acquired until all read locks are released. So the update is waiting for all readers to finish (otherwise they could read inconsistent update). Does it mean that readers could potentially block the writer forever? Nope, the write lock is waiting only for readers that has been started before the write attempt. All reading threads tried to acquire the read lock after the write lock acquisition attempt are waiting for the write lock to be acquired (after all readers started before the write are done) and released (after the write is done). This is how the update is consistent but readers don't block each other. So the final version of the fix is:
+
+[source,java,linenums]
+--------------
+  private static class StringAndNumber {
+    ReadWriteLock lock = new ReentrantReadWriteLock();
+    private int number = 0;
+    private String string = "0";
+    public int getNumber() {
+      lock.readLock().lock();
+      try {
+        return number;
+      } finally {
+        lock.readLock().unlock();
+      }
+    }
+
+    private String getSting() {
+      lock.readLock().lock();
+      try {
+        return string;
+      } finally {
+        lock.readLock().unlock();
+      }
+    }
+
+    synchronized public void increment() {
+      lock.writeLock().lock();
+      try {
+        number++;
+        string = String.valueOf(number);
+      } finally {
+        lock.writeLock().unlock();
+      }
+    }
+
+--------------
+
+`DirtyReadFixTest` proves that the fix is correct. If you are curious to see how read write locks work, please check the `ReadWriteLockTest`.
+
+=== Deadlock
+
+You should be careful when there are more than one lock involved in the thread's synchronization. The deadlock is a situation when two or more threads are waiting for each other to release the lock. Here is an example:
+
+[source,java,linenums]
+---------
+    Lock lockA = new ReentrantLock();
+    Lock lockB = new ReentrantLock();
+    AtomicBoolean protectedSectionReachedByThreadA = new AtomicBoolean(false);
+    Thread threadA = new Thread(() -> {
+      lockA.lock();
+      try {
+        run100Ms();
+        lockB.lock();
+        try {
+          protectedSectionReachedByThreadA.compareAndSet(false, true);
+        } finally {
+          lockB.unlock();
+        }
+      } finally {
+        lockA.unlock();
+      }
+    });
+
+    AtomicBoolean protectedSectionReachedByThreadB = new AtomicBoolean(false);
+    Thread threadB = new Thread(() -> {
+      lockB.lock();
+      try {
+        run100Ms();
+        lockA.lock();
+        try {
+          protectedSectionReachedByThreadB.compareAndSet(false, true);
+        } finally {
+          lockA.unlock();
+        }
+      } finally {
+        lockB.unlock();
+      }
+    });
+
+    threadA.start();
+    threadB.start();
+    threadA.join(200);
+    threadB.join(200);
+    assertThat(protectedSectionReachedByThreadA.get(), is(false));
+    assertThat(protectedSectionReachedByThreadB.get(), is(false));
+    assertThat(threadA.getState(), is(WAITING));
+    assertThat(threadB.getState(), is(WAITING));
+
+---------
+
+Thead A acquires the lockA and waits for the lockB to be released. Thread B acquires the lockB and waits for the lockA to be released. Both threads are waiting for each other forever.
+
+=== Waiting and notifying
+
+So far we have seen how to synchronize threads to keep shared data consistent. But what if one thread need to sync its work not data with another thread? For example, some thread can't proceed until another thread finishes its work. To implement it the threads need to be able to send messages to each other.
+
+One of the ways to have a thread waiting for the another thread to finish is to use `Condition`. The condition is created from a lock and the lock should be acquired before using the condition. Let's see how it works. Below we create a thread that is waiting for a signal from the main thread. It acquires the lock and waits for the signal on the condition. As soon as the `await()` method is called the thread releases the lock and starts waiting. So, the main thread is able to acquire the lock and send the signal. That's not enough for the waiting thread to receive the signal, it should be able to acquire the lock to go ahead, so the main thread should release the lock after the signal is sent. Then the waiting thread continue executing from the `await()` method.
+
+[source,java,linenums]
+-----------
+    ReentrantLock lock = new ReentrantLock();
+    Condition condition = lock.newCondition();
+    AtomicBoolean awaitReached = new AtomicBoolean(false);
+    AtomicBoolean threadIsAwaken = new AtomicBoolean(false);
+    Thread thread = new Thread(() -> {
+      lock.lock();
+      try {
+        awaitReached.compareAndSet(false, true);
+        condition.await();
+        threadIsAwaken.compareAndSet(false, true);
+      } catch (InterruptedException e) {
+        //ignore in this test
+      } finally {
+        lock.unlock();
+      }
+    });
+    thread.start();
+    run100Ms();
+
+    assertThat(awaitReached.get(), is(true));
+    assertThat(threadIsAwaken.get(), is(false));
+
+    // to use condition we need to acquire the lock
+    // otherwise IllegalMonitorStateException is thrown
+    assertThrows(IllegalMonitorStateException.class, condition::signalAll);
+
+    //the thread is waiting for the condition
+    //and it releases the lock
+    assertThat(lock.tryLock(), is(true));
+
+    // now awake the thread
+    condition.signalAll();
+
+    // let's delay a bit to let the thread handle the signal if it's received
+    run100Ms();
+
+    // no, the thread is still awaiting the condition because it can't acquire the lock
+    assertThat(threadIsAwaken.get(), is(false));
+    assertThat(thread.getState(), is(WAITING));
+
+    // now we release the lock
+    lock.unlock();
+
+    // let's delay a bit to make sure that the thread has enough time to receive the signal
+    run100Ms();
+
+    //now the thread is awakened
+    assertThat(threadIsAwaken.get(), is(true));
+    assertThat(thread.getState(), is(TERMINATED));
+-----------
+Important outcome from the above example:
+1. To wait for the condition, we need to acquire the lock.
+2. To signal the condition, we need to acquire the lock.
+3. After the signal is sent/received, we need to release the lock to let another thread to proceed.
+
+This is how the condition is protected from concurrent execution and let threads to communicate with each other.
+
+NOTE: Please note, that to be able to receive the signal, the thread must be waing on `await()` method, not on the `lock.lock()`. If the thread is blocked on the lock acquisition, it can't receive the signal. See `TestReentrantLock.signalIsNotReceivedIfThreadBlockedOnLockAcquisitionNotOnAwait` for details.
+
+== Practice
+
+Having all the above knowledge, we can implement a thing that will be very useful soon. The thing can be used from different threads to split execution into several phases. Each phase is executed by some thread and while the phase is executing other threads are waiting. Then the next phase is started and so on. The `PhaseSync` can be useful to reproduce different race conditions. That's the next topic I'll cover in the future post.
+
+=== First attempt
+
+The class we're going to implement has 4 methods:
+
+1. waitFor(String phaseName)
+2. doneWith(String phaseName)
+3. done()
+4. waitForAllPhases()
+
+
+The `waitFor()` method is used to wait for the phase with the given name to be done. The `doneWith()` method is used to notify the phase with the given name is done. The `done()` method is used to notify all phases are done. The `waitForAllPhases()` method is used to wait for all phases to be done. Here is a usage example:
+
+[source,java,linenums]
+-----------
+    PhaseSyncV1 phaseSync = new PhaseSyncV1();
+    final AtomicReference<String> stages = new AtomicReference<>("");
+    BinaryOperator<String> accumulator = (existing, newValue) -> existing + newValue;
+    CompletableFuture.runAsync(() -> {
+      phaseSync.waitFor("first");
+      stages.getAndAccumulate("2", accumulator);
+      phaseSync.doneWith("second");
+      phaseSync.waitFor("third");
+      stages.getAndAccumulate("4", accumulator);
+      phaseSync.done();
+    });
+    CompletableFuture.runAsync(() -> {
+      stages.getAndAccumulate("1", accumulator);
+      phaseSync.doneWith("first");
+      phaseSync.waitFor("second");
+      stages.getAndAccumulate("3", accumulator);
+      phaseSync.doneWith("third");
+    });
+    phaseSync.waitForAllPhases();
+    assertEquals("1234", stages.get());
+-----------
+
+We create two threads that execute 4 phases. Each phase just adds the phase number to the stages string. The phases are executed in the order they are added. It's checked when the `done()` method is called that all phases are done which unblocks the `phaseSync.waitForAllPhases()`.
+
+NOTE: The CompletableFuture.runAsync() method is just a convenient way to execute a code in a parallel thread. Under the hood it uses the ForkJoinPool.commonPool() to execute the code. The commonPool() is preconfigured thread pool. We discussed thread pools in https://github.com/konoplev/thread#thread-reusing[the previous post].
+
+Our implementation assumes that there are only two threads executing the phases. That's usually enough.
+
+The implementation uses a condition variable to wait for the phase to be done. The `waitFor()` uses the variable to start waiting for the phase to be done. The `doneWith()` method uses the condition to notify when the phase is done. Another condition is used to wait for all phases to be done. You can find the whole implementation in the `PhaseSyncV1` class. Here are just two methods because the methods are important for the following conversation.
+
+[source,java,linenums]
+-----------
+  final Lock lock = new ReentrantLock();
+  final Condition phaseIsDone = lock.newCondition();
+  private String currentPhase = "";
+
+  public void waitFor(String phaseName) {
+    lock.lock();
+    try {
+      while (currentPhase.isEmpty()) {
+        if (!phaseIsDone.await(1, TimeUnit.SECONDS)) {
+          throw new RuntimeException("Timeout waiting for"  + phaseName);
+        }
+      }
+      if (!phaseName.equals(currentPhase)) {
+        throw new IllegalStateException("Expected phase " + phaseName + " but got " + currentPhase);
+      }
+      currentPhase = "";
+    } catch (InterruptedException e) {
+      throw new RuntimeException("Thread interrupted");
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  public void doneWith(String phaseName) {
+    lock.lock();
+    try {
+      if (!currentPhase.isEmpty()) {
+        throw new IllegalStateException("Already in phase " + currentPhase);
+      }
+      currentPhase = phaseName;
+      phaseIsDone.signalAll();
+    } finally {
+      lock.unlock();
+    }
+  }
+-----------
