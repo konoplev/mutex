@@ -11,7 +11,7 @@ import org.junit.jupiter.api.Test;
 @StressCTest
 public class DirtyReadTest {
 
-  private static class StringAndNumber {
+  public static class StringAndNumber {
 
     private int number = 0;
     private String string = "0";
@@ -20,7 +20,7 @@ public class DirtyReadTest {
       return number;
     }
 
-    private String getString() {
+    public String getString() {
       return string;
     }
 

@@ -11,7 +11,7 @@ import org.junit.jupiter.api.Test;
 @StressCTest
 public class DirtyReadFixTest {
 
-  private static class StringAndNumber {
+  public static class StringAndNumber {
     ReadWriteLock lock = new ReentrantReadWriteLock();
     private int number = 0;
     private String string = "0";
@@ -24,7 +24,7 @@ public class DirtyReadFixTest {
       }
     }
 
-    private String getSting() {
+    public String getString() {
       lock.readLock().lock();
       try {
         return string;
@@ -33,7 +33,7 @@ public class DirtyReadFixTest {
       }
     }
 
-    synchronized public void increment() {
+    public void increment() {
       lock.writeLock().lock();
       try {
         number++;
@@ -54,7 +54,7 @@ public class DirtyReadFixTest {
 
   @Operation
   public String getSting() {
-    return counter.getSting();
+    return counter.getString();
   }
 
   @Operation
